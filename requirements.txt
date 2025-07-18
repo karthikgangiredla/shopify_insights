@@ -1,0 +1,230 @@
+### Directory Structure
+# shopify_insights/
+# ├── app/
+# │   ├── __init__.py
+# │   ├── main.py
+# │   ├── models.py
+# │   ├── scraper.py
+# │   ├── utils.py
+# │   ├── database.py
+# ├── requirements.txt
+
+# --- requirements.txt ---
+fastapi
+uvicorn
+requests
+beautifulsoup4
+lxml
+pydantic
+sqlalchemy
+mysql-connector-python
+re
+serpapi
+
+# --- app/__init__.py ---
+
+# Empty initializer
+
+# --- app/models.py ---
+from pydantic import BaseModel
+from typing import List, Optional
+
+class Product(BaseModel):
+    title: str
+    price: Optional[str]
+    url: Optional[str]
+
+class BrandResponse(BaseModel):
+    brand_name: Optional[str]
+    about: Optional[str]
+    contact_emails: List[str]
+    phone_numbers: List[str]
+    social_handles: List[str]
+    products: List[Product]
+    hero_products: List[Product]
+    privacy_policy: Optional[str]
+    refund_policy: Optional[str]
+    faqs: List[dict]
+    important_links: List[str]
+    competitors: Optional[List[str]]
+
+# --- app/utils.py ---
+import re
+
+def extract_emails(text):
+    return re.findall(r'[\w\.-]+@[\w\.-]+', text)
+
+def extract_phone_numbers(text):
+    return re.findall(r'\+?\d[\d\s().-]{7,}\d', text)
+
+def find_links(soup, keywords):
+    links = []
+    for a in soup.find_all('a', href=True):
+        if any(keyword in a.text.lower() for keyword in keywords):
+            links.append(a['href'])
+    return links
+
+# --- app/scraper.py ---
+import requests
+from bs4 import BeautifulSoup
+from app.models import BrandResponse, Product
+from app.utils import extract_emails, extract_phone_numbers, find_links
+import json
+
+def scrape_shopify_site(url: str) -> BrandResponse:
+    if not url.startswith('https://') and not url.startswith('http://'):
+        url = 'https://' + url
+
+    # Product Catalog
+    try:
+        product_res = requests.get(url + '/products.json', timeout=10)
+        products_data = product_res.json().get('products', [])
+    except:
+        products_data = []
+
+    products = [Product(title=p['title'], price=str(p['variants'][0]['price']), url=f"{url}/products/{p['handle']}") for p in products_data]
+
+    res = requests.get(url, timeout=10)
+    soup = BeautifulSoup(res.text, 'lxml')
+    text = soup.get_text()
+
+    brand_name = soup.title.string if soup.title else ""
+    emails = extract_emails(text)
+    phones = extract_phone_numbers(text)
+
+    social_handles = [a['href'] for a in soup.find_all('a', href=True) if any(x in a['href'] for x in ['instagram', 'facebook', 'twitter', 'tiktok'])]
+
+    privacy_links = find_links(soup, ['privacy'])
+    refund_links = find_links(soup, ['refund', 'return'])
+    faq_links = find_links(soup, ['faq', 'help'])
+    contact_links = find_links(soup, ['contact'])
+    important_links = privacy_links + refund_links + faq_links + contact_links
+
+    # Hero products (Extracted as images with product links on homepage)
+    hero_products = []
+    for a in soup.find_all('a', href=True):
+        if '/products/' in a['href']:
+            title = a.text.strip() or 'Hero Product'
+            hero_products.append(Product(title=title, price=None, url=url.rstrip('/') + a['href']))
+
+    # About Us
+    about_text = ''
+    about_section = soup.find('section', {'id': 'about'})
+    if about_section:
+        about_text = about_section.get_text(strip=True)
+    else:
+        about_text = "About section not found"
+
+    # FAQs - Simplified as links for now
+    faqs = [{'question': a.text.strip(), 'answer': 'Available on ' + a['href']} for a in soup.find_all('a', href=True) if 'faq' in a['href'].lower()]
+
+    return BrandResponse(
+        brand_name=brand_name,
+        about=about_text,
+        contact_emails=emails,
+        phone_numbers=phones,
+        social_handles=social_handles,
+        products=products,
+        hero_products=hero_products,
+        privacy_policy=privacy_links[0] if privacy_links else "",
+        refund_policy=refund_links[0] if refund_links else "",
+        faqs=faqs,
+        important_links=important_links,
+        competitors=[]
+    )
+
+# Competitor analysis using SerpAPI (needs API key)
+from serpapi import GoogleSearch
+
+def fetch_competitors(brand_name: str, serpapi_api_key: str):
+    search = GoogleSearch({
+        "q": f"{brand_name} competitors",
+        "api_key": serpapi_api_key
+    })
+    results = search.get_dict()
+    organic_results = results.get('organic_results', [])
+    competitors = [result['link'] for result in organic_results if 'link' in result]
+    return competitors
+
+# --- app/database.py ---
+from sqlalchemy import create_engine, Column, String, Integer, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = "mysql+mysqlconnector://root:password@localhost:3306/shopify_insights"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class Brand(Base):
+    __tablename__ = 'brands'
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255))
+    about = Column(Text)
+    contact_emails = Column(Text)
+    social_handles = Column(Text)
+
+Base.metadata.create_all(bind=engine)
+
+def save_brand_data(brand_data: BrandResponse):
+    db = SessionLocal()
+    brand = Brand(
+        name=brand_data.brand_name,
+        about=brand_data.about,
+        contact_emails=json.dumps(brand_data.contact_emails),
+        social_handles=json.dumps(brand_data.social_handles)
+    )
+    db.add(brand)
+    db.commit()
+    db.close()
+
+# --- app/main.py ---
+from fastapi import FastAPI, HTTPException
+from app.scraper import scrape_shopify_site, fetch_competitors
+from app.models import BrandResponse
+from app.database import save_brand_data
+
+app = FastAPI()
+SERPAPI_API_KEY = 'your_serpapi_api_key'
+
+@app.get("/fetch_brand_insights", response_model=BrandResponse)
+def fetch_brand_insights(website_url: str):
+    try:
+        data = scrape_shopify_site(website_url)
+        if data:
+            # Fetch competitors
+            competitors = fetch_competitors(data.brand_name, SERPAPI_API_KEY)
+            data.competitors = competitors
+            # Persist to DB
+            save_brand_data(data)
+            return data
+        else:
+            raise HTTPException(status_code=401, detail="Website not found or not a Shopify store")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+### Usage:
+# uvicorn app.main:app --reload
+# Visit http://127.0.0.1:8000/docs
+
+### POSTMAN COLLECTION
+# Test with GET request to:
+# http://127.0.0.1:8000/fetch_brand_insights?website_url=example.com
+
+### README.md TEMPLATE
+# Project: Shopify Brand Insights API with Competitor Analysis
+# Features:
+# - Full brand insights from Shopify stores
+# - Hero products, policies, FAQs, about section
+# - Competitor analysis via Google search API
+# - Data persistence in MySQL
+# - REST API with FastAPI
+
+# Setup:
+# 1. Install dependencies from requirements.txt
+# 2. Set MySQL DB connection in database.py
+# 3. Set SERPAPI_API_KEY in main.py
+# 4. Run server: uvicorn app.main:app --reload
+
+# --- END ---
